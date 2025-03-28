@@ -1,0 +1,104 @@
+import os
+import hashlib
+import psutil
+import winreg
+import subprocess
+import json
+import logging
+
+logger = logging.getLogger('SVDF')
+
+class VulnerabilityDetector:
+    def __init__(self):
+        self.critical_paths = [
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            r"C:\Windows\System32\svchost.exe"
+        ]
+        self.known_hashes = self._load_hashes()
+    
+    def _load_hashes(self):
+        try:
+            with open('hashes.json') as f:
+                return json.load(f)
+        except:
+            hashes = {f: hashlib.sha256(open(f,'rb').read()).hexdigest() 
+                     for f in self.critical_paths if os.path.exists(f)}
+            with open('hashes.json', 'w') as f:
+                json.dump(hashes, f)
+            return hashes
+    
+    def full_scan(self):
+        return (self._check_binaries() + 
+                self._check_processes() + 
+                self._check_network() + 
+                self._check_registry() + 
+                self._check_defender())
+    
+    monitor = full_scan
+    
+    def _check_binaries(self):
+        issues = []
+        for path, known_hash in self.known_hashes.items():
+            if not os.path.exists(path):
+                issues.append(self._issue('Missing Binary', 'High', f'Missing: {path}'))
+            elif hashlib.sha256(open(path,'rb').read()).hexdigest() != known_hash:
+                issues.append(self._issue('Modified Binary', 'Critical', f'Modified: {path}'))
+        return issues
+    
+    def _check_processes(self):
+        issues = []
+        suspicious = ['mimikatz', 'netcat', 'nc', 'powershell']
+        for proc in psutil.process_iter(['name', 'exe', 'username']):
+            try:
+                p = proc.info
+                if any(s in p['name'].lower() or (p['exe'] and s in p['exe'].lower()) for s in suspicious):
+                    issues.append(self._issue('Suspicious Process', 'High', f'{p["name"]} (PID: {proc.pid})'))
+                if 'system' in p['username'].lower() and not p['exe'].lower().startswith(r'c:\windows\system32'):
+                    issues.append(self._issue('Privileged Process', 'Medium', f'{p["name"]} running as SYSTEM'))
+            except:
+                continue
+        return issues
+    
+    def _check_network(self):
+        issues = []
+        usual_ports = {135, 139, 445, 3389}
+        for conn in psutil.net_connections('inet'):
+            if conn.status == 'LISTEN' and conn.laddr.port not in usual_ports and conn.laddr.port > 1024:
+                issues.append(self._issue('Suspicious Port', 'Medium', f'Port {conn.laddr.port} listening'))
+        return issues
+    
+    def _check_registry(self):
+        issues = []
+        suspicious_keys = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
+        ]
+        for hive, path in suspicious_keys:
+            try:
+                with winreg.OpenKey(hive, path) as key:
+                    for i in range(winreg.QueryInfoKey(key)[1]):
+                        name, value, _ = winreg.EnumValue(key, i)
+                        if any(s in value.lower() for s in ['powershell', 'cmd', 'wscript']):
+                            issues.append(self._issue('Suspicious Startup', 'High', 
+                                                   f'{name} -> {value}'))
+            except:
+                continue
+        return issues
+    
+    def _check_defender(self):
+        try:
+            output = subprocess.check_output(
+                'powershell Get-MpComputerStatus', 
+                shell=True, text=True)
+            issues = []
+            if "AntivirusEnabled : False" in output:
+                issues.append(self._issue('Security Disabled', 'High', 'Defender disabled'))
+            if "RealTimeProtectionEnabled : False" in output:
+                issues.append(self._issue('Security Disabled', 'High', 'Real-time protection disabled'))
+            return issues
+        except:
+            return [self._issue('Check Failed', 'Medium', 'Defender check failed')]
+    
+    def _issue(self, type_, severity, desc):
+        return {'type': type_, 'severity': severity, 'description': desc}
